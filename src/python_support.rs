@@ -34,7 +34,7 @@ impl PyPaths {
             .map(|value| {
                 let path = Path::new(value);
                 if path.exists() {
-                    Ok(path.canonicalize()?)
+                    Ok(dunce::canonicalize(path)?)
                 } else {
                     Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
                         "Path '{}' does not exist",
