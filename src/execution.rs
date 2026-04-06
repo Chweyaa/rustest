@@ -1795,6 +1795,17 @@ impl<'py> FixtureResolver<'py> {
                 self.indirect_param_override = None;
                 return result;
             }
+
+            // Check if the value is a LazyFixtureWrapper (from pytest-lazy-fixtures).
+            // These wrappers have a `fixture_name` attribute and must be resolved
+            // through the fixture system instead of being passed as raw values.
+            let bound = value.bind(self.py);
+            if let Ok(fixture_name) = bound.getattr("fixture_name") {
+                if let Ok(name_str) = fixture_name.extract::<String>() {
+                    return self.resolve_fixture_value(&name_str);
+                }
+            }
+
             // Otherwise, return the value directly
             return Ok(value.clone_ref(self.py));
         }
