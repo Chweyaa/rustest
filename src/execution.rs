@@ -398,137 +398,176 @@ pub fn run_collected_tests(
             context.current_package = Some(module_package);
         }
 
-        // Reset module-scoped caches for this module
-        context.module_cache.clear();
-        close_event_loop(py, &mut context.module_event_loop);
+        // Group tests by their module-scoped fixture param indices.
+        // This ensures tests sharing the same parametrized module fixture
+        // run together, with module cache cleared between groups — matching
+        // pytest's behavior where each param value gets its own scope.
+        let module_fixture_names: Vec<String> = module
+            .fixtures
+            .iter()
+            .filter(|(_, f)| {
+                f.params.is_some()
+                    && matches!(
+                        f.scope,
+                        FixtureScope::Module | FixtureScope::Session | FixtureScope::Package
+                    )
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
 
-        // Group tests by class for class-scoped fixtures
-        let mut tests_by_class: IndexMap<Option<String>, Vec<&TestCase>> = IndexMap::new();
+        let mut tests_by_module_params: IndexMap<Vec<(String, usize)>, Vec<&TestCase>> =
+            IndexMap::new();
         for test in module.tests.iter() {
-            tests_by_class
-                .entry(test.class_name.clone())
-                .or_default()
-                .push(test);
+            let mut key: Vec<(String, usize)> = module_fixture_names
+                .iter()
+                .filter_map(|fname| {
+                    test.fixture_param_indices
+                        .get(fname)
+                        .map(|&idx| (fname.clone(), idx))
+                })
+                .collect();
+            key.sort();
+            tests_by_module_params.entry(key).or_default().push(test);
         }
 
-        for (_class_name, tests) in tests_by_class {
-            // Reset class-scoped cache for this class
-            context.class_cache.clear();
+        for (_param_key, param_group_tests) in tests_by_module_params {
+            // Clear module cache for each param group so parametrized fixtures
+            // and their dependents are freshly resolved. Module teardowns are
+            // deferred until after all param groups complete so that
+            // non-parametrized yield fixtures (e.g. autouse mocks) stay active.
+            context.module_cache.clear();
+            close_event_loop(py, &mut context.module_event_loop);
 
-            // Partition tests for optimal async parallelization
-            let execution_units =
-                partition_tests_for_parallel(py, &tests, &module.fixtures, config);
-
-            for unit in execution_units {
-                let (unit_results, is_plain_function_test): (Vec<PyTestResult>, bool) = match unit {
-                    TestExecutionUnit::Single(test) => {
-                        let result = run_single_test(py, module, test, config, &mut context)?;
-                        let is_plain = test.class_name.is_none();
-                        (vec![result], is_plain)
-                    }
-                    TestExecutionUnit::Batch(batch) => {
-                        let batch_results =
-                            run_async_batch(py, module, &batch, config, &mut context)?;
-                        // For batches, check if any test is a plain function test
-                        let any_plain = batch.tests.iter().any(|t| t.class_name.is_none());
-                        (
-                            batch_results.into_iter().map(|(_, r)| r).collect(),
-                            any_plain,
-                        )
-                    }
-                };
-
-                let mut should_fail_fast = false;
-
-                for result in unit_results {
-                    let is_failed = result.status == "failed";
-
-                    // Update global and per-file counters
-                    match result.status.as_str() {
-                        "passed" => {
-                            passed += 1;
-                            file_passed += 1;
-                        }
-                        "failed" => {
-                            failed += 1;
-                            file_failed += 1;
-                        }
-                        "skipped" => {
-                            skipped += 1;
-                            file_skipped += 1;
-                        }
-                        _ => {
-                            failed += 1;
-                            file_failed += 1;
-                        }
-                    }
-
-                    // Notify renderer of test completion
-                    renderer.test_completed(&result);
-
-                    results.push(result);
-
-                    // Check for fail-fast mode
-                    if config.fail_fast && is_failed {
-                        should_fail_fast = true;
-                    }
-                }
-
-                // If this was a plain function test (no class), clear class cache
-                // Class-scoped fixtures should NOT be shared across plain function tests
-                if is_plain_function_test {
-                    context.class_cache.clear();
-                    finalize_generators(
-                        py,
-                        &mut context.teardowns.class,
-                        context.class_event_loop.as_ref(),
-                    );
-                }
-
-                // Handle fail-fast after processing all results in the unit
-                if should_fail_fast {
-                    // Clean up fixtures before returning early
-                    context.cleanup_all(py);
-
-                    let duration = start.elapsed();
-                    let total = passed + failed + skipped;
-
-                    // Notify renderer of early exit
-                    renderer.finish_suite(
-                        total,
-                        passed,
-                        failed,
-                        skipped,
-                        collection_errors.len(),
-                        duration,
-                    );
-
-                    let report = PyRunReport::new(
-                        total,
-                        passed,
-                        failed,
-                        skipped,
-                        duration.as_secs_f64(),
-                        results,
-                        collection_errors.to_vec(),
-                    );
-
-                    // Write cache before returning
-                    write_failed_tests_cache(&report)?;
-
-                    return Ok(report);
-                }
-
-                // Check for signals (like Ctrl+C) after each execution unit
-                // This allows users to interrupt test runs with KeyboardInterrupt
-                py.check_signals()?;
+            // Group tests by class for class-scoped fixtures
+            let mut tests_by_class: IndexMap<Option<String>, Vec<&TestCase>> = IndexMap::new();
+            for test in param_group_tests {
+                tests_by_class
+                    .entry(test.class_name.clone())
+                    .or_default()
+                    .push(test);
             }
 
-            // Class-scoped fixtures are dropped here - run teardowns
-            context.teardown_scope(py, FixtureScope::Class);
+            for (_class_name, tests) in tests_by_class {
+                // Reset class-scoped cache for this class
+                context.class_cache.clear();
+
+                // Partition tests for optimal async parallelization
+                let execution_units =
+                    partition_tests_for_parallel(py, &tests, &module.fixtures, config);
+
+                for unit in execution_units {
+                    let (unit_results, is_plain_function_test): (Vec<PyTestResult>, bool) =
+                        match unit {
+                            TestExecutionUnit::Single(test) => {
+                                let result =
+                                    run_single_test(py, module, test, config, &mut context)?;
+                                let is_plain = test.class_name.is_none();
+                                (vec![result], is_plain)
+                            }
+                            TestExecutionUnit::Batch(batch) => {
+                                let batch_results =
+                                    run_async_batch(py, module, &batch, config, &mut context)?;
+                                // For batches, check if any test is a plain function test
+                                let any_plain = batch.tests.iter().any(|t| t.class_name.is_none());
+                                (
+                                    batch_results.into_iter().map(|(_, r)| r).collect(),
+                                    any_plain,
+                                )
+                            }
+                        };
+
+                    let mut should_fail_fast = false;
+
+                    for result in unit_results {
+                        let is_failed = result.status == "failed";
+
+                        // Update global and per-file counters
+                        match result.status.as_str() {
+                            "passed" => {
+                                passed += 1;
+                                file_passed += 1;
+                            }
+                            "failed" => {
+                                failed += 1;
+                                file_failed += 1;
+                            }
+                            "skipped" => {
+                                skipped += 1;
+                                file_skipped += 1;
+                            }
+                            _ => {
+                                failed += 1;
+                                file_failed += 1;
+                            }
+                        }
+
+                        // Notify renderer of test completion
+                        renderer.test_completed(&result);
+
+                        results.push(result);
+
+                        // Check for fail-fast mode
+                        if config.fail_fast && is_failed {
+                            should_fail_fast = true;
+                        }
+                    }
+
+                    // If this was a plain function test (no class), clear class cache
+                    // Class-scoped fixtures should NOT be shared across plain function tests
+                    if is_plain_function_test {
+                        context.class_cache.clear();
+                        finalize_generators(
+                            py,
+                            &mut context.teardowns.class,
+                            context.class_event_loop.as_ref(),
+                        );
+                    }
+
+                    // Handle fail-fast after processing all results in the unit
+                    if should_fail_fast {
+                        // Clean up fixtures before returning early
+                        context.cleanup_all(py);
+
+                        let duration = start.elapsed();
+                        let total = passed + failed + skipped;
+
+                        // Notify renderer of early exit
+                        renderer.finish_suite(
+                            total,
+                            passed,
+                            failed,
+                            skipped,
+                            collection_errors.len(),
+                            duration,
+                        );
+
+                        let report = PyRunReport::new(
+                            total,
+                            passed,
+                            failed,
+                            skipped,
+                            duration.as_secs_f64(),
+                            results,
+                            collection_errors.to_vec(),
+                        );
+
+                        // Write cache before returning
+                        write_failed_tests_cache(&report)?;
+
+                        return Ok(report);
+                    }
+
+                    // Check for signals (like Ctrl+C) after each execution unit
+                    // This allows users to interrupt test runs with KeyboardInterrupt
+                    py.check_signals()?;
+                }
+
+                // Class-scoped fixtures are dropped here - run teardowns
+                context.teardown_scope(py, FixtureScope::Class);
+            }
         }
 
-        // Module-scoped fixtures are dropped here - run teardowns
+        // Module-scoped fixtures are dropped here - run all teardowns after all param groups
         finalize_generators(
             py,
             &mut context.teardowns.module,
